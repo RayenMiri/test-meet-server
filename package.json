@@ -1,7 +1,9 @@
 {
     "scripts": {
-      "start": "node server.js",
-      "dev": "nodemon server.js"
+        "start": "node server.js",
+        "dev": "nodemon server.js"
+    },
+    "dependencies": {
+        "socket-io": "^1.0.0"
     }
-  }
-  
+}
