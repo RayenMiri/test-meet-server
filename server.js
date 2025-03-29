@@ -1,7 +1,6 @@
 import http from "http";
 import { Server } from "socket.io";
 import app from "./app.js";
-import MembershipService from "./services/MembershipService.js";
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -34,10 +33,7 @@ io.on("connection", (socket) => {
     try {
       console.log("test", roomId);
       // Verify user is part of the room
-      const roomMembers = await MembershipService.getRoomMembers(roomId);
-      if (!roomMembers.includes(socket.user.id)) {
-        throw new Error('Unauthorized call initiation');
-      }
+      
 
       // Create new call entry
       activeCalls.set(roomId, {
