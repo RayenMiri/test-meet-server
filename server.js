@@ -1,7 +1,6 @@
 import http from "http";
 import { Server } from "socket.io";
 import app from "./app.js";
-import jwt from "jsonwebtoken";
 import MembershipService from "./services/MembershipService.js";
 
 const server = http.createServer(app);
