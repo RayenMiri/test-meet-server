@@ -3,9 +3,7 @@ import { Server } from "socket.io";
 import { PeerServer } from "peer";
 import app from "./app.js";
 import jwt from "jsonwebtoken";
-import MessageService from "./services/MessageService.js";
 import User from "./models/User.js";
-import MembershipService from "./services/MembershipService.js";
 
 // Create main HTTP server
 const server = http.createServer(app);
