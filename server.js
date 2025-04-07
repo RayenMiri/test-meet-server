@@ -1,9 +1,16 @@
 import http from "http";
 import { Server } from "socket.io";
+import { PeerServer } from "peer";
 import app from "./app.js";
 import jwt from "jsonwebtoken";
+import MessageService from "./services/MessageService.js";
+import User from "./models/User.js";
+import MembershipService from "./services/MembershipService.js";
 
+// Create main HTTP server
 const server = http.createServer(app);
+
+// Configure Socket.IO
 const io = new Server(server, {
   cors: {
     origin: process.env.CLIENT_URL,
@@ -12,111 +19,196 @@ const io = new Server(server, {
   }
 });
 
-  //Socket.IO Authentication Middleware
- io.use((socket, next) => {
-   const token = socket.handshake.auth.token;
-   if (!token) return next(new Error("Authentication error"));
+// Configure PeerServer FIRST
+const peerServer = PeerServer({
+  server: server,
+  path: "/peerjs",
+  port: 9000,
+  proxied: true,
+  allow_discovery: true
+});
+// Authentication middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error("Authentication error"));
   
-   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-     if (err) return next(new Error("Authentication error"));
-     socket.user = decoded;
-     next();
-   });
- });
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return next(new Error("Authentication error"));
+    socket.user = decoded;
+    next();
+  });
+});
 
+// Track active rooms: Map<roomId, Map<peerId, userId>>
+const activeRooms = new Map();
+
+// Track user-to-peer mappings
+const userToPeerMap = new Map();
+
+// Utility functions
+const getRoomMembers = (roomId) => {
+  return activeRooms.has(roomId) 
+    ? Array.from(activeRooms.get(roomId).values())
+    : [];
+};
+
+const removePeerFromRooms = (peerId) => {
+  activeRooms.forEach((peers, roomId) => {
+    if (peers.has(peerId)) {
+      peers.delete(peerId);
+      io.to(roomId).emit("peer-disconnected", { peerId });
+      if (peers.size === 0) activeRooms.delete(roomId);
+    }
+  });
+};
+
+// Socket.IO event handlers
 io.on("connection", (socket) => {
   console.log(`User ${socket.user.id} connected`);
+  let currentPeerId = null;
 
-  // WebRTC Signaling Events
-  const activeCalls = new Map(); // roomId => { participants: Set<userId>, offer: any, answer: any }
+  // Save the mapping when the user joins a room
+  socket.on("register-peer", (peerId) => {
+    userToPeerMap.set(socket.user.id, peerId);
+    console.log(`Mapped User ID ${socket.user.id} to Peer ID ${peerId}`);
+  });
 
-  socket.on('call-initiate', async ({ roomId, offer, callType }) => {
+  // Provide the Peer ID for a given user ID
+  socket.on("get-peer-id", (userId, callback) => {
+    const peerId = userToPeerMap.get(userId);
+    if (peerId) {
+      callback({ peerId });
+    } else {
+      callback({ error: "Peer ID not found" });
+    }
+  });
+
+  // Room management
+  socket.on("join-room", async (roomId, peerId) => {
     try {
-      console.log("test", roomId);
-      // Verify user is part of the room
-      
+      // Validate membership
+      // const isMember = await MembershipService.verifyMembership(socket.user.id, roomId);
+      // if (!isMember) throw new Error("User not authorized for this room");
 
-      // Create new call entry
-      activeCalls.set(roomId, {
-        participants: new Set([socket.user.id]),
-        offer,
-        answer: null,
-        callType,
-        initiator: socket.user.id
+      // Initialize room structure
+      if (!activeRooms.has(roomId)) {
+        activeRooms.set(roomId, new Map());
+      }
+
+      const room = activeRooms.get(roomId);
+      
+      // Add peer to room
+      room.set(peerId, socket.user.id);
+      currentPeerId = peerId;
+      socket.join(roomId);
+
+      // Notify existing peers
+      const existingPeers = Array.from(room.keys()).filter(id => id !== peerId);
+      socket.emit("existing-peers", existingPeers);
+
+      // Notify others about new peer
+      socket.to(roomId).emit("peer-connected", { 
+        peerId,
+        userId: socket.user.id 
       });
 
-      // Notify other room members
-      socket.to(roomId).emit('call-incoming', {
+      console.log(`User ${socket.user.id} (${peerId}) joined room ${roomId}`);
+    } catch (error) {
+      socket.emit("room-error", { error: error.message });
+    }
+  });
+
+  // // Message handling
+  // socket.on("client-message-created", async (message, callback) => {
+  //   try {
+  //     const newMessage = await MessageService.createMessage({
+  //       ...message,
+  //       sender: socket.user.id
+  //     });
+
+  //     io.to(message.room.toString()).emit("server-message-created", newMessage);
+  //     callback({ status: "success" });
+  //   } catch (error) {
+  //     callback({ status: "error", error: error.message });
+  //   }
+  // });
+
+  // Typing indicators
+  const typingTimeouts = new Map();
+  socket.on('typing-start', async (roomId) => {
+    console.log(`User ${socket.user.id} is typing in room ${roomId}`);
+    try {
+      const timeoutKey = `${roomId}-${socket.user.id}`;
+      const user = await User.findById(socket.user.id);
+  
+      clearTimeout(typingTimeouts.get(timeoutKey));
+  
+      // Emit only to others in the room (not to the sender)
+      // This didn't work even though the socket.to does not send it to the user who emitted the event 
+      socket.to(roomId).emit('user-typing', {
         roomId,
-        offer,
-        callType,
-        initiator: socket.user.id
+        userId: socket.user.id,
+        userName: `${user.firstName} ${user.lastName}`
+      });
+  
+      // Set auto-stop timeout
+      typingTimeouts.set(timeoutKey, setTimeout(() => {
+        socket.to(roomId).emit('user-stopped-typing', {
+          roomId,
+          userId: socket.user.id,
+        });
+        typingTimeouts.delete(timeoutKey);
+      }, 3000));
+    } catch (error) {
+      console.error('Error in typing-start:', error);
+    }
+  });
+  
+  socket.on('typing-stop', (roomId) => {
+    try {
+      const timeoutKey = `${roomId}-${socket.user.id}`;
+      clearTimeout(typingTimeouts.get(timeoutKey));
+      typingTimeouts.delete(timeoutKey);
+      
+      // Emit only to others in the room (not to the sender)
+      socket.to(roomId).emit('user-stopped-typing', {
+        roomId,
+        userId: socket.user.id
       });
     } catch (error) {
-      socket.emit('call-error', { error: error.message });
+      console.error('Error in typing-stop:', error);
     }
   });
 
-  socket.on('call-answer', ({ roomId, answer }) => {
-    const call = activeCalls.get(roomId);
-    if (!call) {
-      return socket.emit('call-error', { error: 'Call no longer exists' });
-    }
-
-    call.answer = answer;
-    call.participants.add(socket.user.id);
-    
-    // Send answer to initiator
-    socket.to(call.initiator).emit('call-answer-received', { answer });
-  });
-
-  socket.on('ice-candidate', ({ roomId, candidate }) => {
-    console.log(candidate);
-    const validatedCandidate = {
-      candidate: candidate.candidate,
-      sdpMid: candidate.sdpMid || null,
-      sdpMLineIndex: candidate.sdpMLineIndex ?? null,
-      usernameFragment: candidate.usernameFragment || null
-    };
-    
-    socket.to(roomId).emit('ice-candidate', {
-      candidate: validatedCandidate,
-      senderId: socket.user.id
-    });
-  });
-
-  socket.on('call-end', ({ roomId }) => {
-    const call = activeCalls.get(roomId);
-    if (!call) return;
-
-    io.to(roomId).emit('call-ended', { endedBy: socket.user.id });
-    activeCalls.delete(roomId);
-  });
-
-  socket.on('call-reject', ({ roomId }) => {
-    const call = activeCalls.get(roomId);
-    if (call?.initiator) {
-      socket.to(call.initiator).emit('call-rejected', {
-        rejecterId: socket.user.id
-      });
-    }
-  });
-
+  // Cleanup on disconnect
   socket.on("disconnect", () => {
-    activeCalls.forEach((call, roomId) => {
-      if (call.participants.has(socket.user.id)) {
-        io.to(roomId).emit('call-ended', { 
-          endedBy: socket.user.id,
-          reason: 'participant-left'
-        });
-        activeCalls.delete(roomId);
+    console.log(`User ${socket.user.id} disconnected`);
+    
+    // Remove from active rooms
+    if (currentPeerId) {
+      removePeerFromRooms(currentPeerId);
+    }
+
+    // Remove the mapping
+    userToPeerMap.delete(socket.user.id);
+    console.log(`Removed mapping for User ID ${socket.user.id}`);
+
+    // Clear typing indicators
+    typingTimeouts.forEach((timeout, key) => {
+      if (key.includes(socket.user.id)) {
+        clearTimeout(timeout);
+        typingTimeouts.delete(key);
       }
     });
   });
 });
 
+// Attach io instance to app
 app.set("io", io);
 
-server.listen(process.env.PORT, () => {
-  console.log(`Server running on port: ${process.env.PORT}`);
+// Start server
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`PeerJS server available at /peerjs`);
 });
